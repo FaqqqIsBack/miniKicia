@@ -1,6 +1,7 @@
--- miniKicia v2 — walk + slide speed, independent sliders with type-in
--- Walk multiplier only touches walking. Slide multiplier only touches sliding.
--- Same KiciaHook hygiene: env probe, capability stubs, cloneref, upvalue proxy.
+-- miniKicia v3 — walk + slide, independent sliders, type-in, duration-compensated slide.
+-- Walk mult affects walking only. Slide mult affects slide speed only.
+-- When slide mult < 1, slide duration is extended by 1/mult so total distance is preserved.
+-- KiciaHook hygiene: env probe, capability stubs, cloneref, upvalue proxies.
 
 (function()
 
@@ -60,13 +61,16 @@ local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 local LP = Players.LocalPlayer
 
 local State = {
-    Enabled    = true,
-    WalkMult   = 1,
-    SlideMult  = 1,
-    HookLoaded = false,
-    HookGet    = nil,
-    HookIdx    = nil,
-    HookOld    = nil,
+    Enabled        = true,
+    WalkMult       = 1,
+    SlideMult      = 1,
+    HookLoaded     = false,
+    SlideHookLoaded = false,
+    HookGet        = nil,
+    HookIdx        = nil,
+    HookOld        = nil,
+    SlideGet       = nil,
+    SlideRestore   = nil,
 }
 
 local MechanicsCache = nil
@@ -91,6 +95,7 @@ local function isSlidingNow()
     return false
 end
 
+-- ─── walkspeed hook ─────────────────────────────────────────────────
 local function loadWalkHook()
     if State.HookLoaded then return true end
     if type(debug.getupvalues) ~= 'function'
@@ -130,7 +135,6 @@ local function loadWalkHook()
             local base = rawget(oldTable, 'BASE_WALKSPEED')
             if not State.Enabled then return base end
 
-            -- Slide detection: state flag first, stack name as fallback.
             local sliding = isSlidingNow()
             if not sliding then
                 for level = 2, 5 do
@@ -153,13 +157,139 @@ local function loadWalkHook()
     return true
 end
 
-local function unloadWalkHook()
-    if not State.HookLoaded then return end
-    if State.HookGet and State.HookIdx and State.HookOld then
-        pcall(debug.setupvalue, State.HookGet, State.HookIdx, State.HookOld)
+-- ─── slide duration hook ────────────────────────────────────────────
+-- Wraps the MechanicsController Slide method. Before the native runs,
+-- scales any duration-like constant on the upvalue table by 1/SlideMult
+-- (only when SlideMult < 1). Restores after. If no duration constant is
+-- found, falls back to a time-field extension on the instance.
+local function scaleDurationValue(v)
+    if type(v) ~= 'number' or v <= 0 then return v end
+    local comp = 1 / State.SlideMult
+    return v * comp
+end
+
+local function loadSlideHook()
+    if State.SlideHookLoaded then return true end
+    if type(debug.getupvalues) ~= 'function' or type(debug.setupvalue) ~= 'function' then
+        return false
     end
-    State.HookLoaded = false
-    State.HookGet, State.HookIdx, State.HookOld = nil, nil, nil
+
+    local mech = resolveMechanics()
+    if type(mech) ~= 'table' then return false end
+
+    local mt  = getmetatable(mech)
+    local idx = type(mt) == 'table' and rawget(mt, '__index') or nil
+    if type(idx) ~= 'table' then return false end
+
+    -- Slide method candidates — RIVALS/Titan naming variants
+    local slideKey, originalSlide
+    for _, name in ipairs({ 'Slide', '_Slide', 'StartSlide', '_StartSlide' }) do
+        local fn = rawget(idx, name)
+        if type(fn) == 'function' then
+            slideKey = name
+            originalSlide = fn
+            break
+        end
+    end
+    if not slideKey then return false end
+
+    -- find upvalue tables that carry duration-like constants
+    local durationSlots = {}  -- { {upIdx, key, original} }
+    for upIdx, upVal in pairs(debug.getupvalues(originalSlide)) do
+        if type(upVal) == 'table' then
+            for k, v in pairs(upVal) do
+                if type(k) == 'string' and type(v) == 'number' and v > 0 then
+                    local lk = k:lower()
+                    if lk:find('time', 1, true)
+                        or lk:find('duration', 1, true)
+                        or lk:find('length', 1, true)
+                        or lk:find('slide', 1, true) then
+                        table.insert(durationSlots, {
+                            table = upVal,
+                            key = k,
+                            original = v,
+                        })
+                    end
+                end
+            end
+        elseif type(upVal) == 'number' and upVal > 0 and upVal < 5 then
+            -- plausible duration constant directly as upvalue
+            table.insert(durationSlots, {
+                upIdx = upIdx,
+                isUpvalue = true,
+                original = upVal,
+            })
+        end
+    end
+
+    local wrapped = function(self, ...)
+        if not State.Enabled or State.SlideMult >= 1 or #durationSlots == 0 then
+            return originalSlide(self, ...)
+        end
+
+        -- scale durations up by 1/SlideMult so displacement stays constant
+        for _, slot in ipairs(durationSlots) do
+            if slot.isUpvalue then
+                pcall(debug.setupvalue, originalSlide, slot.upIdx,
+                    scaleDurationValue(slot.original))
+            else
+                pcall(function()
+                    slot.table[slot.key] = scaleDurationValue(slot.original)
+                end)
+            end
+        end
+
+        local ok, err = pcall(originalSlide, self, ...)
+
+        -- restore immediately; the game has read the constant already
+        for _, slot in ipairs(durationSlots) do
+            if slot.isUpvalue then
+                pcall(debug.setupvalue, originalSlide, slot.upIdx, slot.original)
+            else
+                pcall(function()
+                    slot.table[slot.key] = slot.original
+                end)
+            end
+        end
+
+        if not ok then
+            error(err, 0)
+        end
+    end
+
+    rawset(idx, slideKey, wrapped)
+
+    State.SlideGet = originalSlide
+    State.SlideRestore = function()
+        rawset(idx, slideKey, originalSlide)
+        for _, slot in ipairs(durationSlots) do
+            if slot.isUpvalue then
+                pcall(debug.setupvalue, originalSlide, slot.upIdx, slot.original)
+            else
+                pcall(function()
+                    slot.table[slot.key] = slot.original
+                end)
+            end
+        end
+    end
+    State.SlideHookLoaded = true
+    return true
+end
+
+local function unloadWalkHook()
+    if State.HookLoaded then
+        if State.HookGet and State.HookIdx and State.HookOld then
+            pcall(debug.setupvalue, State.HookGet, State.HookIdx, State.HookOld)
+        end
+        State.HookLoaded = false
+        State.HookGet, State.HookIdx, State.HookOld = nil, nil, nil
+    end
+    if State.SlideHookLoaded then
+        if State.SlideRestore then pcall(State.SlideRestore) end
+        State.SlideHookLoaded = false
+        State.SlideGet = nil
+        State.SlideRestore = nil
+    end
 end
 
 -- ─── UI ─────────────────────────────────────────────────────────────
@@ -216,7 +346,6 @@ local function buildUI()
     tCorner.CornerRadius = UDim.new(0, 4)
     tCorner.Parent = toggle
 
-    -- helper: build one slider row (label + textbox + track)
     local MIN, MAX = 0, 10
 
     local function buildRow(yOffset, labelText, initial, onChange)
@@ -258,7 +387,7 @@ local function buildUI()
         trCorner.Parent = track
 
         local fill = Instance.new('Frame')
-        fill.Size = UDim2.new(initial / MAX, 0, 1, 0)
+        fill.Size = UDim2.new(math.clamp(initial / MAX, 0, 1), 0, 1, 0)
         fill.BackgroundColor3 = Color3.fromRGB(120, 160, 240)
         fill.BorderSizePixel = 0
         fill.Parent = track
@@ -304,10 +433,10 @@ local function buildUI()
             end
         end)
 
-        input.FocusLost:Connect(function(enter)
+        input.FocusLost:Connect(function()
             local n = tonumber(input.Text)
             if n == nil then
-                input.Text = string.format('%.2f', onChange and 1 or 1)
+                input.Text = string.format('%.2f', initial)
                 return
             end
             n = math.clamp(n, MIN, MAX)
@@ -317,11 +446,10 @@ local function buildUI()
         end)
 
         render(initial)
-        return render
     end
 
-    local renderWalk  = buildRow(52, 'walk',  State.WalkMult,  function(v) State.WalkMult = v end)
-    local renderSlide = buildRow(94, 'slide', State.SlideMult, function(v) State.SlideMult = v end)
+    buildRow(52, 'walk',  State.WalkMult,  function(v) State.WalkMult = v end)
+    buildRow(94, 'slide', State.SlideMult, function(v) State.SlideMult = v end)
 
     toggle.MouseButton1Click:Connect(function()
         State.Enabled = not State.Enabled
@@ -337,9 +465,8 @@ buildUI()
 task.spawn(function()
     while true do
         task.wait(0.5)
-        if not State.HookLoaded then
-            loadWalkHook()
-        end
+        if not State.HookLoaded then loadWalkHook() end
+        if not State.SlideHookLoaded then loadSlideHook() end
     end
 end)
 
