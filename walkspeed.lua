@@ -1,11 +1,8 @@
 -- miniKicia v1 — RIVALS walkspeed only (0..10 multiplier)
--- Slide speed is left untouched — walkspeed is the only thing scaled.
--- KiciaHook-derived: env probe, capability stubs, cloneref hygiene,
--- upvalue-proxy walkspeed hook with stack-inspection slide bypass.
+-- Slide speed is fully isolated: slide reads and slide state both bypass the multiplier.
 
 (function()
 
--- ─── env resolution ─────────────────────────────────────────────────
 local function resolveGenv()
     local candidates = {}
     if type(getgenv) == 'function' then
@@ -29,7 +26,6 @@ local genv = resolveGenv()
 if genv.__mk_ran or _G.__mk_ran then return end
 genv.__mk_ran = true
 
--- ─── executor capability stubs ──────────────────────────────────────
 do
     local noop = function() end
     local stubs = {
@@ -52,11 +48,9 @@ local clonefunction = genv.clonefunction
 
 if type(setthreadidentity) == 'function' then pcall(setthreadidentity, 8) end
 
--- ─── clean FireServer (Kicia primitive, kept for future expansion) ─
 local __fireProto = Instance.new('RemoteEvent')
 local cleanFire   = clonefunction(__fireProto.FireServer)
 
--- ─── services ───────────────────────────────────────────────────────
 local Players           = cloneref(game:GetService('Players'))
 local RunService        = cloneref(game:GetService('RunService'))
 local UserInputService  = cloneref(game:GetService('UserInputService'))
@@ -64,7 +58,6 @@ local ReplicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 
 local LP = Players.LocalPlayer
 
--- ─── state ──────────────────────────────────────────────────────────
 local State = {
     Enabled    = true,
     Multiplier = 1,
@@ -74,7 +67,6 @@ local State = {
     HookOld    = nil,
 }
 
--- ─── mechanics controller resolution ────────────────────────────────
 local MechanicsCache = nil
 local function resolveMechanics()
     if MechanicsCache then return MechanicsCache end
@@ -88,7 +80,6 @@ local function resolveMechanics()
     return m
 end
 
--- ─── walkspeed hook ─────────────────────────────────────────────────
 local function loadWalkHook()
     if State.HookLoaded then return true end
     if type(debug.getupvalues) ~= 'function'
@@ -127,9 +118,20 @@ local function loadWalkHook()
 
             local base = rawget(oldTable, 'BASE_WALKSPEED')
 
-            -- Slide path: hand back vanilla base, never scaled.
-            if debug.info(3, 'n') == 'Slide' then
-                return base
+            local m = MechanicsCache
+            if type(m) == 'table' then
+                if rawget(m, 'IsSliding') == true
+                    or rawget(m, '_is_sliding') == true
+                    or rawget(m, 'Sliding') == true then
+                    return base
+                end
+            end
+
+            for level = 2, 5 do
+                local name = debug.info(level, 'n')
+                if type(name) == 'string' and name:lower():find('slide', 1, true) then
+                    return base
+                end
             end
 
             if State.Enabled then
@@ -152,7 +154,6 @@ local function unloadWalkHook()
     State.HookGet, State.HookIdx, State.HookOld = nil, nil, nil
 end
 
--- ─── UI ─────────────────────────────────────────────────────────────
 local function buildUI()
     local screen = Instance.new('ScreenGui')
     screen.Name = 'miniKicia'
@@ -287,7 +288,6 @@ end
 
 buildUI()
 
--- ─── drive the hook ─────────────────────────────────────────────────
 task.spawn(function()
     while true do
         task.wait(0.5)
@@ -297,7 +297,6 @@ task.spawn(function()
     end
 end)
 
--- ─── unload ─────────────────────────────────────────────────────────
 genv.__mk_unload = function()
     unloadWalkHook()
     genv.__mk_ran = nil
