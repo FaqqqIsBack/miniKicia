@@ -1,6 +1,7 @@
--- miniKicia v1 — RIVALS walkspeed (0..10 multiplier)
--- KiciaHook-derived primitives: env probe, capability stubs,
--- cloneref/clonefunction hygiene, upvalue-proxy walkspeed hook.
+-- miniKicia v1 — RIVALS walkspeed only (0..10 multiplier)
+-- Slide speed is left untouched — walkspeed is the only thing scaled.
+-- KiciaHook-derived: env probe, capability stubs, cloneref hygiene,
+-- upvalue-proxy walkspeed hook with stack-inspection slide bypass.
 
 (function()
 
@@ -32,10 +33,10 @@ genv.__mk_ran = true
 do
     local noop = function() end
     local stubs = {
-        cloneref        = function(o) return o end,
-        clonefunction   = function(f) return f end,
-        hookfunction    = function(o) return o end,
-        newcclosure     = function(f) return f end,
+        cloneref          = function(o) return o end,
+        clonefunction     = function(f) return f end,
+        hookfunction      = function(o) return o end,
+        newcclosure       = function(f) return f end,
         getnamecallmethod = function() return '' end,
         setthreadidentity = noop,
         getthreadidentity = function() return 0 end,
@@ -51,9 +52,7 @@ local clonefunction = genv.clonefunction
 
 if type(setthreadidentity) == 'function' then pcall(setthreadidentity, 8) end
 
--- ─── clean FireServer (Kicia primitive) ─────────────────────────────
--- Throwaway RemoteEvent, cloned FireServer = raw native call,
--- bypasses __namecall hooks the game installs on RemoteEvent.
+-- ─── clean FireServer (Kicia primitive, kept for future expansion) ─
 local __fireProto = Instance.new('RemoteEvent')
 local cleanFire   = clonefunction(__fireProto.FireServer)
 
@@ -67,7 +66,7 @@ local LP = Players.LocalPlayer
 
 -- ─── state ──────────────────────────────────────────────────────────
 local State = {
-    Enabled   = true,
+    Enabled    = true,
     Multiplier = 1,
     HookLoaded = false,
     HookGet    = nil,
@@ -79,7 +78,7 @@ local State = {
 local MechanicsCache = nil
 local function resolveMechanics()
     if MechanicsCache then return MechanicsCache end
-    local ps = LP:FindFirstChild('PlayerScripts')
+    local ps   = LP:FindFirstChild('PlayerScripts')
     local ctrl = ps and ps:FindFirstChild('Controllers')
     local mod  = ctrl and ctrl:FindFirstChild('MechanicsController')
     if not mod then return nil end
@@ -89,17 +88,19 @@ local function resolveMechanics()
     return m
 end
 
--- ─── walkspeed hook (Kicia upvalue-proxy pattern) ───────────────────
+-- ─── walkspeed hook ─────────────────────────────────────────────────
 local function loadWalkHook()
     if State.HookLoaded then return true end
-    if type(debug.getupvalues) ~= 'function' or type(debug.setupvalue) ~= 'function' then
+    if type(debug.getupvalues) ~= 'function'
+        or type(debug.setupvalue) ~= 'function'
+        or type(debug.info) ~= 'function' then
         return false
     end
 
     local mech = resolveMechanics()
     if type(mech) ~= 'table' then return false end
 
-    local mt = getmetatable(mech)
+    local mt  = getmetatable(mech)
     local idx = type(mt) == 'table' and rawget(mt, '__index') or nil
     local getWS = type(idx) == 'table' and rawget(idx, '_GetWalkSpeed') or nil
     if type(getWS) ~= 'function' then return false end
@@ -120,11 +121,17 @@ local function loadWalkHook()
     debug.setupvalue(getWS, upIdx, setmetatable({}, {
         __index = function(_, key)
             if key ~= 'BASE_WALKSPEED' then
-                -- kick on foreign reads — same self-destruct Kicia uses
                 pcall(function() LP:Kick('miniKicia: physics integrity') end)
                 return nil
             end
+
             local base = rawget(oldTable, 'BASE_WALKSPEED')
+
+            -- Slide path: hand back vanilla base, never scaled.
+            if debug.info(3, 'n') == 'Slide' then
+                return base
+            end
+
             if State.Enabled then
                 return base * State.Multiplier
             end
@@ -145,7 +152,7 @@ local function unloadWalkHook()
     State.HookGet, State.HookIdx, State.HookOld = nil, nil, nil
 end
 
--- ─── mini UI (no Obsidian — just enough to ship) ────────────────────
+-- ─── UI ─────────────────────────────────────────────────────────────
 local function buildUI()
     local screen = Instance.new('ScreenGui')
     screen.Name = 'miniKicia'
@@ -290,7 +297,7 @@ task.spawn(function()
     end
 end)
 
--- restore on exit
+-- ─── unload ─────────────────────────────────────────────────────────
 genv.__mk_unload = function()
     unloadWalkHook()
     genv.__mk_ran = nil
